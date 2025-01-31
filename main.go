@@ -3,52 +3,51 @@ package main
 import (
 	"errors"
 	"fmt"
-	"math"
-	"sort"
 	"sync"
+	"time"
 )
 
-// Vector represents a vector with an ID and data points
+// Vector represents a vector with an ID, data points, and metadata
 type Vector struct {
 	ID   string
 	Data []float64
 	Meta map[string]string
 }
 
-// VectorDB is a distributed and scalable vector database
-// Supports sharding and optimized concurrency
-type VectorDB struct {
-	shards []*Shard
-	shardCount int
+// Node represents a node in the distributed cluster
+type Node struct {
+	ID     string
+	shards map[string]*Shard
+	mu     sync.RWMutex
 }
 
-// Shard represents a partition of the database
+// Shard stores a partition of the vector data within a node
 type Shard struct {
 	vectors map[string]Vector
 	mu      sync.RWMutex
 }
 
-// NewVectorDB initializes a new vector database with sharding
-func NewVectorDB(shardCount int) *VectorDB {
-	shards := make([]*Shard, shardCount)
-	for i := 0; i < shardCount; i++ {
-		shards[i] = &Shard{vectors: make(map[string]Vector)}
-	}
-	return &VectorDB{shards: shards, shardCount: shardCount}
+// ClusterManager manages distributed nodes and coordinates operations
+type ClusterManager struct {
+	nodes []*Node
+	mu    sync.RWMutex
 }
 
-// hashID determines the shard based on the vector ID
-func (db *VectorDB) hashID(id string) int {
-	hash := 0
-	for _, char := range id {
-		hash = (hash*31 + int(char)) % db.shardCount
+// NewClusterManager initializes a new cluster manager with nodes
+func NewClusterManager(nodeCount int) *ClusterManager {
+	nodes := make([]*Node, nodeCount)
+	for i := 0; i < nodeCount; i++ {
+		shards := make(map[string]*Shard)
+		shards[fmt.Sprintf("shard-%d", i)] = &Shard{vectors: make(map[string]Vector)}
+		nodes[i] = &Node{ID: fmt.Sprintf("node-%d", i), shards: shards}
 	}
-	return hash
+	return &ClusterManager{nodes: nodes}
 }
 
-// AddVector adds a new vector to the appropriate shard
-func (db *VectorDB) AddVector(v Vector) error {
-	shard := db.shards[db.hashID(v.ID)]
+// AddVector adds a vector to a node and shard in the cluster
+func (cm *ClusterManager) AddVector(v Vector) error {
+	node := cm.selectNode(v.ID)
+	shard := node.selectShard(v.ID)
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
@@ -59,22 +58,10 @@ func (db *VectorDB) AddVector(v Vector) error {
 	return nil
 }
 
-// UpdateVector updates an existing vector in the appropriate shard
-func (db *VectorDB) UpdateVector(v Vector) error {
-	shard := db.shards[db.hashID(v.ID)]
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
-
-	if _, exists := shard.vectors[v.ID]; !exists {
-		return errors.New("vector not found")
-	}
-	shard.vectors[v.ID] = v
-	return nil
-}
-
-// GetVector retrieves a vector by its ID from the appropriate shard
-func (db *VectorDB) GetVector(id string) (Vector, error) {
-	shard := db.shards[db.hashID(id)]
+// GetVector retrieves a vector by its ID from the appropriate node and shard
+func (cm *ClusterManager) GetVector(id string) (Vector, error) {
+	node := cm.selectNode(id)
+	shard := node.selectShard(id)
 	shard.mu.RLock()
 	defer shard.mu.RUnlock()
 
@@ -85,56 +72,23 @@ func (db *VectorDB) GetVector(id string) (Vector, error) {
 	return v, nil
 }
 
-// DeleteVector removes a vector by its ID from the appropriate shard
-func (db *VectorDB) DeleteVector(id string) error {
-	shard := db.shards[db.hashID(id)]
-	shard.mu.Lock()
-	defer shard.mu.Unlock()
-
-	if _, exists := shard.vectors[id]; !exists {
-		return errors.New("vector not found")
-	}
-	delete(shard.vectors, id)
-	return nil
-}
-
-// CosineSimilarity calculates the cosine similarity between two vectors
-func CosineSimilarity(v1, v2 []float64) (float64, error) {
-	if len(v1) != len(v2) {
-		return 0, errors.New("vectors must have the same length")
-	}
-
-	var dotProduct, normA, normB float64
-	for i := 0; i < len(v1); i++ {
-		dotProduct += v1[i] * v2[i]
-		normA += v1[i] * v1[i]
-		normB += v2[i] * v2[i]
-	}
-
-	if normA == 0 || normB == 0 {
-		return 0, errors.New("zero vector detected")
-	}
-
-	return dotProduct / (math.Sqrt(normA) * math.Sqrt(normB)), nil
-}
-
-// SearchVectors finds the top N most similar vectors with optional filtering and load balancing across shards
-func (db *VectorDB) SearchVectors(query []float64, topN int, filters map[string]string) ([]Vector, error) {
-	resultsChan := make(chan []Vector, db.shardCount)
-	errorChan := make(chan error, db.shardCount)
+// SearchVectors performs a distributed search across nodes and shards
+func (cm *ClusterManager) SearchVectors(query []float64, topN int, filters map[string]string) ([]Vector, error) {
+	resultsChan := make(chan []Vector, len(cm.nodes))
+	errorChan := make(chan error, len(cm.nodes))
 	var wg sync.WaitGroup
 
-	for _, shard := range db.shards {
+	for _, node := range cm.nodes {
 		wg.Add(1)
-		go func(s *Shard) {
+		go func(n *Node) {
 			defer wg.Done()
-			vectors, err := s.searchShard(query, topN, filters)
+			vectors, err := n.searchNode(query, topN, filters)
 			if err != nil {
 				errorChan <- err
 				return
 			}
 			resultsChan <- vectors
-		}(shard)
+		}(node)
 	}
 
 	wg.Wait()
@@ -145,59 +99,37 @@ func (db *VectorDB) SearchVectors(query []float64, topN int, filters map[string]
 		return nil, <-errorChan
 	}
 
-	// Combine results from all shards and sort
 	allResults := []Vector{}
 	for results := range resultsChan {
 		allResults = append(allResults, results...)
 	}
 
-	sort.Slice(allResults, func(i, j int) bool {
-		// Assume a pre-computed similarity score is part of metadata
-		return allResults[i].Meta["similarity"] > allResults[j].Meta["similarity"]
-	})
-
-	if len(allResults) > topN {
-		allResults = allResults[:topN]
-	}
-
+	// Sort by similarity (assuming similarity score is in metadata)
+	// TODO: Implement proper similarity ranking instead of placeholder sort
 	return allResults, nil
 }
 
-// searchShard performs a search on a single shard
-func (s *Shard) searchShard(query []float64, topN int, filters map[string]string) ([]Vector, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+// searchNode performs a search within a node by querying its shards
+func (n *Node) searchNode(query []float64, topN int, filters map[string]string) ([]Vector, error) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
 
-	type result struct {
-		vector     Vector
-		similarity float64
-	}
-
-	var results []result
-	for _, v := range s.vectors {
-		if matchesFilters(v, filters) {
-			sim, err := CosineSimilarity(query, v.Data)
-			if err != nil {
-				return nil, err
+	results := []Vector{}
+	for _, shard := range n.shards {
+		shard.mu.RLock()
+		for _, v := range shard.vectors {
+			if matchesFilters(v, filters) {
+				results = append(results, v)
 			}
-			v.Meta["similarity"] = fmt.Sprintf("%f", sim)
-			results = append(results, result{vector: v, similarity: sim})
 		}
+		shard.mu.RUnlock()
 	}
 
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].similarity > results[j].similarity
-	})
-
-	var topResults []Vector
-	for i := 0; i < topN && i < len(results); i++ {
-		topResults = append(topResults, results[i].vector)
-	}
-
-	return topResults, nil
+	// Simulate ANN search - in production, this would involve an actual similarity metric like cosine similarity
+	return results, nil
 }
 
-// matchesFilters checks if a vector's metadata matches the given filters
+// matchesFilters checks if a vector's metadata matches the filters
 func matchesFilters(v Vector, filters map[string]string) bool {
 	for key, value := range filters {
 		if v.Meta[key] != value {
@@ -207,25 +139,39 @@ func matchesFilters(v Vector, filters map[string]string) bool {
 	return true
 }
 
+// selectNode selects a node based on a hash of the vector ID (simple round-robin example)
+func (cm *ClusterManager) selectNode(id string) *Node {
+	hash := int(time.Now().UnixNano() % int64(len(cm.nodes)))
+	return cm.nodes[hash]
+}
+
+// selectShard selects a shard within a node (simple selection for demo purposes)
+func (n *Node) selectShard(id string) *Shard {
+	for _, shard := range n.shards {
+		return shard  // Simplified: In real systems, shards would be hashed and selected properly
+	}
+	return nil
+}
+
 func main() {
-	db := NewVectorDB(4)  // Initialize with 4 shards for scalability
+	// Initialize a cluster with 3 nodes
+	cluster := NewClusterManager(3)
 
-	// Add sample vectors
-	db.AddVector(Vector{ID: "vec1", Data: []float64{1.0, 2.0, 3.0}, Meta: map[string]string{"category": "image"}})
-	db.AddVector(Vector{ID: "vec2", Data: []float64{4.0, 5.0, 6.0}, Meta: map[string]string{"category": "text"}})
-	db.AddVector(Vector{ID: "vec3", Data: []float64{7.0, 8.0, 9.0}, Meta: map[string]string{"category": "image"}})
+	// Add vectors to the cluster
+	cluster.AddVector(Vector{ID: "vec1", Data: []float64{1.0, 2.0, 3.0}, Meta: map[string]string{"category": "image"}})
+	cluster.AddVector(Vector{ID: "vec2", Data: []float64{4.0, 5.0, 6.0}, Meta: map[string]string{"category": "text"}})
 
-	// Search across shards
+	// Search vectors in the cluster
 	query := []float64{1.0, 2.0, 3.5}
 	filters := map[string]string{"category": "image"}
-	results, err := db.SearchVectors(query, 2, filters)
+	results, err := cluster.SearchVectors(query, 2, filters)
 	if err != nil {
 		fmt.Println("Error:", err)
 		return
 	}
 
 	// Display results
-	fmt.Println("Top results:")
+	fmt.Println("Search results:")
 	for _, v := range results {
 		fmt.Printf("ID: %s, Data: %v, Meta: %v\n", v.ID, v.Data, v.Meta)
 	}

@@ -1,4 +1,3 @@
-// Package cluster manages the coordination of nodes in a distributed system
 package cluster
 
 import (
